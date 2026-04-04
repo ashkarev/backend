@@ -9,11 +9,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ✅ MSAL Configuration
+//  MSAL Configuration
 const config = {
   auth: {
     clientId: process.env.CLIENT_ID,
-    authority: `https://login.microsoftonline.com/${process.env.TENANT_ID}`,
+    authority: "https://login.microsoftonline.com/common",
   },
 };
 
