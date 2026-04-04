@@ -6,7 +6,10 @@ import { PublicClientApplication } from "@azure/msal-node";
 dotenv.config();
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: ['http://localhost:5173', 'https://entra-gjvt.vercel.app'],
+  credentials: true
+}));
 app.use(express.json());
 
 //  MSAL Configuration
