@@ -7,16 +7,22 @@ dotenv.config();
 
 const app = express();
 app.use(cors({
-  origin: ['http://localhost:5173', 'https://entra-gjvt.vercel.app'],
+  origin: [
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    'https://entra-gjvt.vercel.app'
+  ],
   credentials: true
 }));
 app.use(express.json());
 
-//  MSAL Configuration
+// MSAL Configuration - Dynamic authority
 const config = {
   auth: {
     clientId: process.env.CLIENT_ID,
-    authority: "https://login.microsoftonline.com/common",
+    authority: process.env.TENANT_ID 
+      ? `https://login.microsoftonline.com/${process.env.TENANT_ID}`
+      : "https://login.microsoftonline.com/common",
   },
 };
 
@@ -26,38 +32,55 @@ const pca = new PublicClientApplication(config);
 const deviceFlows = new Map();
 
 // =====================================
-// DEVICE CODE FLOW
+// DEVICE CODE FLOW - FIXED RACE CONDITION
 // =====================================
 
-// Start device code authentication
 app.post("/auth/device-code/start", async (req, res) => {
   const flowId = Date.now().toString();
 
   try {
-    const deviceCodeRequest = {
-      scopes: ["User.Read", "offline_access"],
-      deviceCodeCallback: (response) => {
-        // Store the device code info
-        deviceFlows.set(flowId, {
-          status: "pending",
-          userCode: response.userCode,
-          deviceCode: response.deviceCode,
-          verificationUri: response.verificationUri,
-          message: response.message,
-          expiresIn: response.expiresIn,
+    // Promise that resolves when callback fires
+    const waitForCallback = new Promise((resolve, reject) => {
+      const deviceCodeRequest = {
+        scopes: ["User.Read", "offline_access"],
+        deviceCodeCallback: (response) => {
+          deviceFlows.set(flowId, {
+            status: "pending",
+            userCode: response.userCode,
+            deviceCode: response.deviceCode,
+            verificationUri: response.verificationUri,
+            message: response.message,
+            expiresIn: response.expiresIn,
+          });
+          console.log(`[Device Code Flow ${flowId}] User code: ${response.userCode}`);
+          resolve(); // Callback fired successfully
+        },
+      };
+
+      // Start the flow
+      pca.acquireTokenByDeviceCode(deviceCodeRequest)
+        .then((tokenResponse) => {
+          deviceFlows.set(flowId, {
+            status: "success",
+            accessToken: tokenResponse.accessToken,
+            account: tokenResponse.account,
+            expiresOn: tokenResponse.expiresOn,
+          });
+          console.log(`[Device Code Flow ${flowId}] ✅ Authentication successful`);
+        })
+        .catch((error) => {
+          deviceFlows.set(flowId, {
+            status: "failed",
+            error: error.message,
+          });
+          console.error(`[Device Code Flow ${flowId}] ❌ Authentication failed:`, error.message);
         });
+    });
 
-        console.log(`[Device Code Flow ${flowId}] User code: ${response.userCode}`);
-      },
-    };
+    // Wait for callback to fire
+    await waitForCallback;
 
-    // Start the flow (this will poll in background)
-    const tokenPromise = pca.acquireTokenByDeviceCode(deviceCodeRequest);
-
-    // Wait a moment for deviceCodeCallback to execute
-    await new Promise((resolve) => setTimeout(resolve, 500));
-
-    // Send the device code info to frontend
+    // Get flow info and send to frontend
     const flowInfo = deviceFlows.get(flowId);
     if (!flowInfo) {
       return res.status(500).json({ error: "Failed to initiate device code flow" });
@@ -71,24 +94,6 @@ app.post("/auth/device-code/start", async (req, res) => {
       expiresIn: flowInfo.expiresIn,
     });
 
-    // Handle token acquisition in background
-    tokenPromise
-      .then((tokenResponse) => {
-        deviceFlows.set(flowId, {
-          status: "success",
-          accessToken: tokenResponse.accessToken,
-          account: tokenResponse.account,
-          expiresOn: tokenResponse.expiresOn,
-        });
-        console.log(`[Device Code Flow ${flowId}] ✅ Authentication successful`);
-      })
-      .catch((error) => {
-        deviceFlows.set(flowId, {
-          status: "failed",
-          error: error.message,
-        });
-        console.error(`[Device Code Flow ${flowId}] ❌ Authentication failed:`, error.message);
-      });
   } catch (error) {
     console.error("Device code flow error:", error);
     res.status(500).json({ error: error.message });
@@ -153,11 +158,7 @@ app.get("/auth/prt/info", (req, res) => {
 
 // Simulate PRT-like silent token acquisition
 app.post("/auth/prt/silent-token", async (req, res) => {
-  const { accountId } = req.body;
-
   try {
-    // In real PRT scenario, this would use cached PRT
-    // For demo, we attempt silent token acquisition
     const accounts = await pca.getTokenCache().getAllAccounts();
     
     if (accounts.length === 0) {
@@ -200,7 +201,6 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString() });
 });
 
-// Get all cached accounts
 app.get("/auth/accounts", async (req, res) => {
   try {
     const accounts = await pca.getTokenCache().getAllAccounts();
@@ -217,7 +217,6 @@ app.get("/auth/accounts", async (req, res) => {
   }
 });
 
-// Clear all cached tokens (logout)
 app.post("/auth/logout", async (req, res) => {
   try {
     const accounts = await pca.getTokenCache().getAllAccounts();
@@ -232,24 +231,23 @@ app.post("/auth/logout", async (req, res) => {
 });
 
 // =====================================
-// START SERVER
+// START SERVER - Bind to 127.0.0.1
 // =====================================
 
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`
- Entra ID Authentication Server
+🚀 Entra ID Authentication Server
 ================================
-Server running on: http://localhost:${PORT}
-
+Server running on: http://127.0.0.1:${PORT}
 
 Available Endpoints:
-- POST /auth/device-code/start     → Start device code flow
-- GET  /auth/device-code/status/:flowId → Poll flow status
-- GET  /auth/prt/info              → PRT information
-- POST /auth/prt/silent-token      → Simulate PRT silent auth
-- GET  /auth/accounts              → List cached accounts
-- POST /auth/logout                → Clear all tokens
-- GET  /health                     → Health check
+- POST /auth/device-code/start
+- GET  /auth/device-code/status/:flowId
+- GET  /auth/prt/info
+- POST /auth/prt/silent-token
+- GET  /auth/accounts
+- POST /auth/logout
+- GET  /health
   `);
 });
