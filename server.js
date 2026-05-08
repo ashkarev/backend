@@ -20,9 +20,7 @@ app.use(express.json());
 const config = {
   auth: {
     clientId: process.env.CLIENT_ID,
-    authority: process.env.TENANT_ID 
-      ? `https://login.microsoftonline.com/${process.env.TENANT_ID}`
-      : "https://login.microsoftonline.com/common",
+    authority: "https://login.microsoftonline.com/common",
   },
 };
 
