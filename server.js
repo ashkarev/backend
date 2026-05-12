@@ -2,6 +2,8 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import { PublicClientApplication } from "@azure/msal-node";
+import jwt from "jsonwebtoken";
+import jwksClient from "jwks-rsa";
 
 dotenv.config();
 
@@ -16,236 +18,114 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// MSAL Configuration - Dynamic authority
-const config = {
+// =====================================
+// MSAL CONFIGURATION (for Device Code)
+// =====================================
+
+const msalConfig = {
   auth: {
     clientId: process.env.CLIENT_ID,
-    authority: "https://login.microsoftonline.com/common",
-  },
+    authority: `https://login.microsoftonline.com/${process.env.TENANT_ID || 'common'}`,
+  }
 };
 
-const pca = new PublicClientApplication(config);
+const pca = new PublicClientApplication(msalConfig);
 
-// In-memory storage for device code flows
+// In-memory store for device code flows (still needed for polling, but short-lived)
 const deviceFlows = new Map();
 
 // =====================================
-// DEVICE CODE FLOW - FIXED RACE CONDITION
+// TOKEN VALIDATION MIDDLEWARE
 // =====================================
 
+const client = jwksClient({
+  jwksUri: `https://login.microsoftonline.com/common/discovery/v2.0/keys`
+});
+
+function getKey(header, callback) {
+  client.getSigningKey(header.kid, function(err, key) {
+    var signingKey = key.publicKey || key.rsaPublicKey;
+    callback(null, signingKey);
+  });
+}
+
+const validateToken = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ error: "No token provided" });
+
+  const token = authHeader.split(" ")[1];
+  jwt.verify(token, getKey, {
+    audience: process.env.CLIENT_ID,
+    issuer: `https://login.microsoftonline.com/${process.env.TENANT_ID}/v2.0`
+  }, (err, decoded) => {
+    if (err) return res.status(401).json({ error: "Invalid token", details: err.message });
+    req.user = decoded;
+    next();
+  });
+};
+
+// =====================================
+// ENDPOINTS
+// =====================================
+
+// Device Code Flow Start
 app.post("/auth/device-code/start", async (req, res) => {
   const flowId = Date.now().toString();
 
   try {
-    // Promise that resolves when callback fires
-    const waitForCallback = new Promise((resolve, reject) => {
-      const deviceCodeRequest = {
-        scopes: ["User.Read", "offline_access"],
-        deviceCodeCallback: (response) => {
-          deviceFlows.set(flowId, {
-            status: "pending",
-            userCode: response.userCode,
-            deviceCode: response.deviceCode,
-            verificationUri: response.verificationUri,
-            message: response.message,
-            expiresIn: response.expiresIn,
-          });
-          console.log(`[Device Code Flow ${flowId}] User code: ${response.userCode}`);
-          resolve(); // Callback fired successfully
-        },
-      };
-
-      // Start the flow
-      pca.acquireTokenByDeviceCode(deviceCodeRequest)
-        .then((tokenResponse) => {
-          deviceFlows.set(flowId, {
-            status: "success",
-            accessToken: tokenResponse.accessToken,
-            account: tokenResponse.account,
-            expiresOn: tokenResponse.expiresOn,
-          });
-          console.log(`[Device Code Flow ${flowId}] ✅ Authentication successful`);
-        })
-        .catch((error) => {
-          deviceFlows.set(flowId, {
-            status: "failed",
-            error: error.message,
-          });
-          console.error(`[Device Code Flow ${flowId}] ❌ Authentication failed:`, error.message);
-        });
-    });
-
-    // Wait for callback to fire
-    await waitForCallback;
-
-    // Get flow info and send to frontend
-    const flowInfo = deviceFlows.get(flowId);
-    if (!flowInfo) {
-      return res.status(500).json({ error: "Failed to initiate device code flow" });
-    }
-
-    res.json({
-      flowId,
-      userCode: flowInfo.userCode,
-      verificationUri: flowInfo.verificationUri,
-      message: flowInfo.message,
-      expiresIn: flowInfo.expiresIn,
-    });
-
-  } catch (error) {
-    console.error("Device code flow error:", error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Poll for device code flow status
-app.get("/auth/device-code/status/:flowId", (req, res) => {
-  const { flowId } = req.params;
-  const flow = deviceFlows.get(flowId);
-
-  if (!flow) {
-    return res.status(404).json({ error: "Flow not found" });
-  }
-
-  if (flow.status === "success") {
-    res.json({
-      status: "success",
-      account: {
-        username: flow.account.username,
-        name: flow.account.name,
-      },
-      expiresOn: flow.expiresOn,
-    });
-  } else if (flow.status === "failed") {
-    res.json({
-      status: "failed",
-      error: flow.error,
-    });
-  } else {
-    res.json({
-      status: "pending",
-      userCode: flow.userCode,
-      verificationUri: flow.verificationUri,
-    });
-  }
-});
-
-// =====================================
-// PRIMARY REFRESH TOKEN (PRT) INFO
-// =====================================
-
-app.get("/auth/prt/info", (req, res) => {
-  res.json({
-    name: "Primary Refresh Token (PRT)",
-    description: "PRT is a special JWT token used by Windows 10/11 for SSO across apps and services.",
-    requirements: [
-      "Windows 10/11 device joined to Azure AD",
-      "Windows Hello or device registration",
-      "Enterprise environment with Conditional Access policies",
-    ],
-    note: "True PRT flow requires device-level registration and cannot be fully demonstrated in a web app. This endpoint provides information about PRT concepts.",
-    referenceFlow: {
-      step1: "User authenticates with Windows Hello/PIN on Azure AD-joined device",
-      step2: "Device obtains PRT from Azure AD",
-      step3: "Apps use PRT to silently acquire access tokens without re-authentication",
-      step4: "PRT is bound to device TPM for security",
-    },
-    simulatedBehavior: "In this demo, we show the concept through device code flow, which shares similar silent authentication principles.",
-  });
-});
-
-// Simulate PRT-like silent token acquisition
-app.post("/auth/prt/silent-token", async (req, res) => {
-  try {
-    const accounts = await pca.getTokenCache().getAllAccounts();
-    
-    if (accounts.length === 0) {
-      return res.status(401).json({
-        error: "No cached accounts found",
-        message: "In real PRT flow, the device would have a cached PRT. Please authenticate first using device code flow.",
-      });
-    }
-
-    const silentRequest = {
-      account: accounts[0],
+    const deviceCodeRequest = {
       scopes: ["User.Read"],
+      deviceCodeCallback: (response) => {
+        deviceFlows.set(flowId, {
+          status: "pending",
+          userCode: response.userCode,
+          verificationUri: response.verificationUri,
+          message: response.message,
+        });
+      },
     };
 
-    const tokenResponse = await pca.acquireTokenSilent(silentRequest);
+    // Background promise for token acquisition
+    pca.acquireTokenByDeviceCode(deviceCodeRequest)
+      .then((response) => {
+        deviceFlows.set(flowId, {
+          status: "success",
+          account: {
+            username: response.account.username,
+            name: response.account.name,
+          }
+        });
+      })
+      .catch((err) => {
+        deviceFlows.set(flowId, { status: "failed", error: err.message });
+      });
 
-    res.json({
-      status: "success",
-      message: "Token acquired silently (simulating PRT behavior)",
-      account: {
-        username: tokenResponse.account.username,
-        name: tokenResponse.account.name,
-      },
-      expiresOn: tokenResponse.expiresOn,
-    });
-  } catch (error) {
-    res.status(401).json({
-      error: "Silent authentication failed",
-      message: error.message,
-      note: "This simulates PRT token refresh failure. User would need to re-authenticate.",
-    });
-  }
-});
+    // Wait briefly for callback to fire
+    await new Promise(resolve => setTimeout(resolve, 500));
 
-// =====================================
-// UTILITY ENDPOINTS
-// =====================================
+    const flow = deviceFlows.get(flowId);
+    res.json({ flowId, ...flow });
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
-});
-
-app.get("/auth/accounts", async (req, res) => {
-  try {
-    const accounts = await pca.getTokenCache().getAllAccounts();
-    res.json({
-      count: accounts.length,
-      accounts: accounts.map((acc) => ({
-        username: acc.username,
-        name: acc.name,
-        environment: acc.environment,
-      })),
-    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.post("/auth/logout", async (req, res) => {
-  try {
-    const accounts = await pca.getTokenCache().getAllAccounts();
-    for (const account of accounts) {
-      await pca.getTokenCache().removeAccount(account);
-    }
-    deviceFlows.clear();
-    res.json({ message: "All accounts logged out", count: accounts.length });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
+// Device Code Status Polling
+app.get("/auth/device-code/status/:flowId", (req, res) => {
+  const flow = deviceFlows.get(req.params.flowId);
+  if (!flow) return res.status(404).json({ error: "Flow not found" });
+  res.json(flow);
 });
 
-// =====================================
-// START SERVER - Bind to 127.0.0.1
-// =====================================
+// Protected Profile Endpoint (Example)
+app.get("/api/profile", validateToken, (req, res) => {
+  res.json({ message: "Access granted", user: req.user });
+});
+
+app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`
-🚀 Entra ID Authentication Server
-================================
-Server running on: http://127.0.0.1:${PORT}
-
-Available Endpoints:
-- POST /auth/device-code/start
-- GET  /auth/device-code/status/:flowId
-- GET  /auth/prt/info
-- POST /auth/prt/silent-token
-- GET  /auth/accounts
-- POST /auth/logout
-- GET  /health
-  `);
+  console.log(`Server running on port ${PORT}`);
 });
